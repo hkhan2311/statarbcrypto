@@ -1,0 +1,372 @@
+ta_functions
+#Includes code used to calculate five technical indicators used in code.
+def calc_adx(df: pd.DataFrame, param_combinations: List[Dict[str, int]]) -> pd.DataFrame:
+    """
+    Calculate Average Directional Index (ADX) for multiple period parameter combinations
+    in a more efficient, vectorized way using Pandas ewm.
+
+    ADX measures the strength of a trend (regardless of direction).
+
+    Args:
+        df (pd.DataFrame): Must contain 'high', 'low', and 'close' columns.
+        param_combinations (List[Dict[str, int]]): Each dict has:
+            - period (int): Time period for ADX calculation (default: 14)
+
+    Returns:
+        pd.DataFrame with columns named like: adx_p14, one per param combination.
+    """
+    required_cols = ['high', 'low', 'close']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError("DataFrame must contain 'high', 'low', and 'close' columns")
+
+    results = pd.DataFrame(index=df.index)
+    n = len(df)
+    if n == 0:
+        return results
+
+    # Extract unique periods
+    periods = {p.get('period', 14) for p in param_combinations}
+
+    # Convert to NumPy for fast math
+    high = df['high'].to_numpy()
+    low = df['low'].to_numpy()
+    close = df['close'].to_numpy()
+
+    # Previous close for TR calculations
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]  # or you can keep it the same as close[0]
+
+    # True Range
+    tr_array = np.maximum.reduce([
+        high - low,
+        np.abs(high - prev_close),
+        np.abs(low - prev_close)
+    ])
+
+    # +DM and -DM
+    high_shift = np.roll(high, 1)
+    low_shift = np.roll(low, 1)
+    high_diff = high - high_shift
+    low_diff = low_shift - low
+
+    # Zero out the first shift-based diff
+    high_diff[0] = 0
+    low_diff[0] = 0
+
+    plus_dm_array = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0)
+    minus_dm_array = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
+
+    # Put them into a temporary DataFrame for easy .ewm() usage
+    tmp_df = pd.DataFrame({
+        'tr': tr_array,
+        'plus_dm': plus_dm_array,
+        'minus_dm': minus_dm_array
+    }, index=df.index)
+
+    # We'll store final ADX arrays in adx_cache to avoid recomputing duplicates
+    adx_cache = {}
+
+    for period in periods:
+        if period <= 0 or period > n:
+            # Invalid period => just fill with NaN
+            adx_cache[period] = np.full(n, np.nan, dtype=float)
+            continue
+
+        alpha = 1.0 / period  # Wilder's smoothing factor
+
+        # --- 1) Smooth TR, +DM, -DM via EWM ---
+        smooth_tr = tmp_df['tr'].ewm(alpha=alpha, adjust=False).mean()
+        smooth_plus_dm = tmp_df['plus_dm'].ewm(alpha=alpha, adjust=False).mean()
+        smooth_minus_dm = tmp_df['minus_dm'].ewm(alpha=alpha, adjust=False).mean()
+
+        # --- 2) Compute +DI, -DI ---
+        plus_di = 100.0 * (smooth_plus_dm / smooth_tr)
+        minus_di = 100.0 * (smooth_minus_dm / smooth_tr)
+
+        # --- 3) Compute DX ---
+        di_sum = plus_di + minus_di
+        di_diff = (plus_di - minus_di).abs()
+        dx = 100.0 * di_diff / di_sum
+
+        # --- 4) Finally, ADX = EWM of DX ---
+        # This is again Wilder's smoothing with alpha = 1/period.
+        adx_series = dx.ewm(alpha=alpha, adjust=False).mean()
+
+        # Typically, the first (period-1) bars are NaN to mimic the
+        # "we don't have enough data yet" effect.
+        adx_series.iloc[:period-1] = np.nan
+
+        # Save result as NumPy array
+        adx_cache[period] = adx_series.to_numpy()
+
+    # Build final columns for each param combination
+    for params in param_combinations:
+        period = params.get('period', 14)
+        col_suffix = f"_p{period}"
+        results[f"adx{col_suffix}"] = adx_cache[period]
+
+    return results
+def calc_macd(df: pd.DataFrame, param_combinations: List[Dict[str,int]]) -> pd.DataFrame:
+    """
+    Calculate MACD more efficiently by using the existing calc_ema function to avoid redundant computations.
+    """
+
+    results = pd.DataFrame(index=df.index)
+
+    # Extract unique fast and slow periods
+    fast_periods = {p.get('fast_period', 12) for p in param_combinations}
+    slow_periods = {p.get('slow_period', 26) for p in param_combinations}
+    unique_periods = fast_periods.union(slow_periods)
+
+    # Prepare parameter combinations for calc_ema
+    # calc_ema expects a list of parameter dictionaries with 'period'
+    ema_param_combinations = [{'period': period} for period in unique_periods]
+
+    # Compute all required EMAs at once using the existing calc_ema function
+    # This function returns columns named 'ema_p{period}'
+    ema_df = calc_ema(df, ema_param_combinations)
+
+    # Create a quick lookup to get EMA series from ema_df
+    # For example, ema_df['ema_p12'] for 12-period EMA
+    def get_ema(period):
+        return ema_df[f'ema_p{period}']
+
+    for params in param_combinations:
+        fast_period = params.get('fast_period', 12)
+        slow_period = params.get('slow_period', 26)
+        signal_period = params.get('signal_period', 9)
+
+        # Retrieve the precomputed EMAs
+        fast_ema = get_ema(fast_period)
+        slow_ema = get_ema(slow_period)
+
+        # MACD Line
+        macd_line = fast_ema - slow_ema
+
+        # Signal line (EMA of macd_line)
+        # Since macd_line isn't directly from 'close', we compute this EMA here
+        signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+
+        # Histogram
+        histogram = macd_line - signal_line
+
+        suffix = f"_f{fast_period}_s{slow_period}_sig{signal_period}"
+        results[f'macd_line{suffix}'] = macd_line
+        results[f'macd_signal{suffix}'] = signal_line
+        results[f'macd_hist{suffix}'] = histogram
+
+    return results
+def calc_obv(df: pd.DataFrame, param_combinations: List[Dict[str,int]]) -> pd.DataFrame:
+    """
+    Calculate OBV following standard definition.
+    Matches TA-Lib's OBV implementation.
+    
+    Formula:
+    If close > prev_close:
+        OBV = prev_OBV + volume
+    If close < prev_close:
+        OBV = prev_OBV - volume
+    If close = prev_close:
+        OBV = prev_OBV
+    
+    Args:
+        df (pd.DataFrame): DataFrame with 'close' and 'volume' columns
+        param_combinations (List[Dict[str,int]]): List of parameter dictionaries
+        
+    Returns:
+        pd.DataFrame: DataFrame containing OBV values
+    """
+    results = pd.DataFrame(index=df.index)
+    
+    # Initialize OBV
+    obv = pd.Series(0.0, index=df.index)
+    
+    # Calculate price direction
+    close_diff = df['close'].diff()
+    
+    # Calculate OBV according to standard rules
+    for i in range(1, len(df)):
+        if close_diff.iloc[i] > 0:
+            obv.iloc[i] = obv.iloc[i-1] + df['volume'].iloc[i]
+        elif close_diff.iloc[i] < 0:
+            obv.iloc[i] = obv.iloc[i-1] - df['volume'].iloc[i]
+        else:
+            obv.iloc[i] = obv.iloc[i-1]
+    
+    for params in param_combinations:
+        smooth_period = params.get('smooth_period', 0)
+        
+        if smooth_period > 0:
+            obv_smoothed = obv.ewm(span=smooth_period, adjust=False).mean()
+            results[f'obv_s{smooth_period}'] = obv_smoothed
+        else:
+            results['obv'] = obv
+    
+    return results
+def calc_cci(df: pd.DataFrame, param_combinations: List[Dict[str, int]]) -> pd.DataFrame:
+    """
+    Calculate Commodity Channel Index (CCI) for multiple period combinations, using
+    Pandas rolling means with 'min_periods=1' for skip-NaN logic.
+    
+    CCI = (Typical Price - SMA(TP)) / (0.015 * Mean Deviation)
+    where:
+    - Typical Price = (High + Low + Close) / 3
+    - Mean Deviation = rolling mean of abs(TP - SMA(TP))
+    - 0.015 is the standard constant
+
+    Args:
+        df (pd.DataFrame): Must contain 'high', 'low', 'close' columns
+        param_combinations (List[Dict[str, int]]): Each dict has:
+        - period (int): Period for SMA (default: 20)
+
+    Returns:
+        pd.DataFrame with columns named like: cci_p20
+    """
+    required_cols = ['high', 'low', 'close']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"DataFrame must contain columns: {required_cols}")
+
+    n = len(df)
+    results = pd.DataFrame(index=df.index)
+    if n == 0:
+        return results
+
+    # 1) Compute typical price as a Series
+    typical_price = (df['high'] + df['low'] + df['close']) / 3.0
+
+    # Get all unique periods
+    periods = {p.get('period', 20) for p in param_combinations}
+
+    # Cache results for each period
+    cci_cache = {}
+    constant = 0.015  # standard CCI multiplier
+
+    for period in periods:
+        if period <= 0 or period > n:
+            # Invalid period => all NaNs
+            cci_cache[period] = pd.Series(np.nan, index=df.index)
+            continue
+        
+        # 2) Rolling SMA of typical price (skip-NaN approach)
+        tp_sma = typical_price.rolling(window=period, min_periods=1).mean()
+
+        # 3) Rolling mean of the absolute deviation from that SMA (skip-NaN approach)
+        abs_dev = (typical_price - tp_sma).abs()
+        mean_dev = abs_dev.rolling(window=period, min_periods=1).mean()
+
+        # 4) Compute CCI, avoiding divide-by-zero
+        denom = (constant * mean_dev).replace({0: np.nan})
+        cci = (typical_price - tp_sma) / denom
+
+        cci_cache[period] = cci
+
+    # Build final results DataFrame
+    for params in param_combinations:
+        period = params.get('period', 20)
+        col_name = f"cci_p{period}"
+        results[col_name] = cci_cache[period]
+
+    return results
+def calc_cmo(df: pd.DataFrame, param_combinations: List[Dict[str, int]]) -> pd.DataFrame:
+    """
+    Calculate Chande Momentum Oscillator (CMO) for multiple periods in a
+    single vectorized pass using NumPy.
+
+    CMO = 100 * (Sum_up - Sum_down) / (Sum_up + Sum_down)
+
+    Args:
+        df (pd.DataFrame): Must contain 'close' column.
+        param_combinations (List[Dict[str, int]]): Each dict has:
+            - period (int): Period for momentum calculation (default=14)
+
+    Returns:
+        pd.DataFrame with columns named like: cmo_p14, cmo_p20, etc.
+    """
+    if 'close' not in df.columns:
+        raise ValueError("DataFrame must contain 'close' column")
+
+    n = len(df)
+    results = pd.DataFrame(index=df.index)
+    if n == 0:
+        return results
+
+    # 1) Convert to NumPy
+    close = df['close'].to_numpy()
+
+    # 2) Price changes (first bar = 0)
+    price_change = np.zeros_like(close)
+    if n > 1:
+        price_change[1:] = close[1:] - close[:-1]
+
+    # 3) Up/Down moves
+    up_moves = np.clip(price_change, 0, None)
+    down_moves = np.clip(-price_change, 0, None)
+
+    # 4) Skip NaN logic => fill them with 0
+    np.nan_to_num(up_moves, copy=False, nan=0.0)
+    np.nan_to_num(down_moves, copy=False, nan=0.0)
+
+    # 5) Cumulative sums
+    up_cumsum = np.cumsum(up_moves)
+    down_cumsum = np.cumsum(down_moves)
+
+    # Extract sorted unique periods so we can map each back after vector calculations
+    unique_periods = sorted({p.get('period', 14) for p in param_combinations})
+    k = len(unique_periods)
+    if k == 0:
+        return results
+
+    # Prepare 2D arrays to hold partial sums for each period:
+    # sum_up_2D and sum_down_2D will each be shape (n, k)
+    sum_up_2D = np.zeros((n, k), dtype=float)
+    sum_down_2D = np.zeros((n, k), dtype=float)
+
+    # 6) For each period, fill partial sums from cumsum:
+    #    sum_up[:p] = up_cumsum[:p]
+    #    sum_up[p:] = up_cumsum[p:] - up_cumsum[:-p]
+    for col_idx, period in enumerate(unique_periods):
+        if period <= 0 or period > n:
+            # Entire column => NaN
+            sum_up_2D[:, col_idx] = np.nan
+            sum_down_2D[:, col_idx] = np.nan
+        else:
+            # First 'period' bars: partial window
+            sum_up_2D[:period, col_idx] = up_cumsum[:period]
+            sum_down_2D[:period, col_idx] = down_cumsum[:period]
+
+            # Rest of bars
+            sum_up_2D[period:, col_idx] = (
+                up_cumsum[period:] - up_cumsum[:-period]
+            )
+            sum_down_2D[period:, col_idx] = (
+                down_cumsum[period:] - down_cumsum[:-period]
+            )
+
+    # 7) Compute CMO in 2D
+    denom_2D = sum_up_2D + sum_down_2D
+    # Where denom=0 => replace with NaN
+    zero_mask = (denom_2D == 0)
+    denom_2D[zero_mask] = np.nan
+
+    cmo_2D = 100.0 * (sum_up_2D - sum_down_2D) / denom_2D
+    # Put NaNs back into zero_mask
+    cmo_2D[zero_mask] = np.nan
+
+    # 8) Build final columns
+    # Map each requested (period) to its cmo_2D column
+    # param_combinations might repeat the same period, so we cache columns
+    cmo_columns_cache = {}
+    for col_idx, period in enumerate(unique_periods):
+        if period <= 0 or period > n:
+            cmo_series = pd.Series(np.nan, index=df.index)
+        else:
+            cmo_series = pd.Series(cmo_2D[:, col_idx], index=df.index)
+        cmo_columns_cache[period] = cmo_series
+
+    # Now assign them in the requested order
+    for params in param_combinations:
+        period = params.get('period', 14)
+        col_name = f"cmo_p{period}"
+        results[col_name] = cmo_columns_cache[period]
+
+    return results
